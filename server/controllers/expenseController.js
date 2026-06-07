@@ -1,14 +1,13 @@
-const Expense = require('../models/Expense');
 const { validationResult } = require('express-validator');
-const mongoose = require('mongoose');
+const prisma = require('../config/prisma');
 
 const CATEGORIES = ['food', 'transport', 'entertainment', 'bills', 'other'];
 
 const buildFilter = (userId, query) => {
-  const filter = { userId: new mongoose.Types.ObjectId(userId) };
+  const filter = { userId };
 
   if (query.q) {
-    filter.title = { $regex: query.q, $options: 'i' };
+    filter.title = { contains: query.q, mode: 'insensitive' };
   }
 
   if (query.category) {
@@ -20,7 +19,7 @@ const buildFilter = (userId, query) => {
     if (year && month) {
       const start = new Date(year, month - 1, 1);
       const end = new Date(year, month, 1);
-      filter.date = { $gte: start, $lt: end };
+      filter.date = { gte: start, lt: end };
     }
   }
 
@@ -30,70 +29,69 @@ const buildFilter = (userId, query) => {
 const getExpenses = async (req, res) => {
   try {
     const filter = buildFilter(req.user.id, req.query);
-    const expenses = await Expense.find(filter).sort({ date: -1 });
+    const expenses = await prisma.expense.findMany({
+      where: filter,
+      orderBy: { date: 'desc' },
+    });
     res.json(expenses);
   } catch (error) {
+    console.error('Expense getExpenses error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
 const getSummary = async (req, res) => {
   try {
-    const userId = new mongoose.Types.ObjectId(req.user.id);
+    const userId = req.user.id;
 
-    const [totalResult, byCategory, monthly, recent] = await Promise.all([
-      Expense.aggregate([
-        { $match: { userId } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]),
-      Expense.aggregate([
-        { $match: { userId } },
-        { $group: { _id: '$category', total: { $sum: '$amount' } } },
-        { $project: { _id: 0, category: '$_id', total: 1 } },
-        { $sort: { total: -1 } },
-      ]),
-      Expense.aggregate([
-        { $match: { userId } },
-        {
-          $group: {
-            _id: {
-              year: { $year: '$date' },
-              month: { $month: '$date' },
-            },
-            total: { $sum: '$amount' },
-          },
-        },
-        {
-          $project: {
-            _id: 0,
-            month: {
-              $concat: [
-                { $toString: '$_id.year' },
-                '-',
-                {
-                  $cond: {
-                    if: { $lt: ['$_id.month', 10] },
-                    then: { $concat: ['0', { $toString: '$_id.month' }] },
-                    else: { $toString: '$_id.month' },
-                  },
-                },
-              ],
-            },
-            total: 1,
-          },
-        },
-        { $sort: { month: -1 } },
-      ]),
-      Expense.find({ userId }).sort({ date: -1 }).limit(5),
-    ]);
+    // Get total
+    const totalResult = await prisma.expense.aggregate({
+      where: { userId },
+      _sum: { amount: true },
+    });
+
+    // Get by category
+    const byCategory = await prisma.expense.groupBy({
+      by: ['category'],
+      where: { userId },
+      _sum: { amount: true },
+      orderBy: { _sum: { amount: 'desc' } },
+    });
+
+    // Get monthly data
+    const expenses = await prisma.expense.findMany({
+      where: { userId },
+      select: { amount: true, date: true },
+    });
+
+    const monthlyMap = {};
+    expenses.forEach((exp) => {
+      const month = exp.date.toISOString().slice(0, 7);
+      monthlyMap[month] = (monthlyMap[month] || 0) + exp.amount;
+    });
+
+    const monthly = Object.entries(monthlyMap)
+      .map(([month, total]) => ({ month, total }))
+      .sort((a, b) => b.month.localeCompare(a.month));
+
+    // Get recent expenses
+    const recent = await prisma.expense.findMany({
+      where: { userId },
+      orderBy: { date: 'desc' },
+      take: 5,
+    });
 
     res.json({
-      total: totalResult[0]?.total || 0,
-      byCategory,
+      total: totalResult._sum.amount || 0,
+      byCategory: byCategory.map((item) => ({
+        category: item.category,
+        total: item._sum.amount || 0,
+      })),
       monthly,
       recent,
     });
   } catch (error) {
+    console.error('Expense getSummary error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
@@ -105,12 +103,15 @@ const createExpense = async (req, res) => {
   }
 
   try {
-    const expense = await Expense.create({
-      ...req.body,
-      userId: req.user.id,
+    const expense = await prisma.expense.create({
+      data: {
+        ...req.body,
+        userId: req.user.id,
+      },
     });
     res.status(201).json(expense);
   } catch (error) {
+    console.error('Expense createExpense error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
@@ -122,35 +123,39 @@ const updateExpense = async (req, res) => {
   }
 
   try {
-    const expense = await Expense.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
-      req.body,
-      { new: true, runValidators: true }
-    );
+    const expense = await prisma.expense.updateMany({
+      where: { id: parseInt(req.params.id), userId: req.user.id },
+      data: req.body,
+    });
 
-    if (!expense) {
+    if (expense.count === 0) {
       return res.status(404).json({ message: 'Expense not found' });
     }
 
-    res.json(expense);
+    const updatedExpense = await prisma.expense.findUnique({
+      where: { id: parseInt(req.params.id) },
+    });
+
+    res.json(updatedExpense);
   } catch (error) {
+    console.error('Expense updateExpense error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
 const deleteExpense = async (req, res) => {
   try {
-    const expense = await Expense.findOneAndDelete({
-      _id: req.params.id,
-      userId: req.user.id,
+    const expense = await prisma.expense.deleteMany({
+      where: { id: parseInt(req.params.id), userId: req.user.id },
     });
 
-    if (!expense) {
+    if (expense.count === 0) {
       return res.status(404).json({ message: 'Expense not found' });
     }
 
     res.json({ message: 'Expense deleted' });
   } catch (error) {
+    console.error('Expense deleteExpense error:', error);
     res.status(500).json({ message: 'Server error' });
   }
 };

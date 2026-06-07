@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const connectDB = require('./config/db');
 const authRoutes = require('./routes/authRoutes');
 const expenseRoutes = require('./routes/expenseRoutes');
 
@@ -26,29 +25,13 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-const withDB = async (req, res, next) => {
-  try {
-    await connectDB();
-    next();
-  } catch (error) {
-    res.status(500).json({ message: 'Database connection failed' });
-  }
-};
-
-app.use('/api/auth', withDB, authRoutes);
-app.use('/api/expenses', withDB, expenseRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/expenses', expenseRoutes);
 
 if (!process.env.VERCEL) {
-  connectDB()
-    .then(() => {
-      app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-      });
-    })
-    .catch((error) => {
-      console.error('MongoDB connection error:', error.message);
-      process.exit(1);
-    });
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 }
 
 module.exports = app;
